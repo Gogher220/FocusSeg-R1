@@ -1,0 +1,54 @@
+{
+    "model_name": "Sa2VA_Pro",
+    "model_type": "sa2va_pro",
+    "llm_source": "Qwen2-VL-2B-Instruct",
+    "version": "1.0.0",
+    "description": "Sa2VA with Video R1 LLM integration",
+    "architecture": {
+        "vision_encoder": "SAM2",
+        "language_model": "Qwen2-VL-2B-Instruct",
+        "grounding_encoder": "SAM2"
+    },
+    "model_config": {
+        "hidden_size": 2048,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "intermediate_size": 8192,
+        "vocab_size": 151936,
+        "vision_config": {
+            "hidden_size": 1280,
+            "num_hidden_layers": 32,
+            "patch_size": 14,
+            "spatial_merge_size": 2
+        },
+        "text_config": {
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16
+        }
+    },
+    "sam2_config": {
+        "hidden_dim": 256,
+        "image_size": 1024,
+        "num_maskmem": 7,
+        "multimask_output": true
+    },
+    "preprocessing": {
+        "min_pixels": 512,
+        "max_pixels": 2048,
+        "target_length": 1024
+    },
+    "inference": {
+        "max_new_tokens": 2048,
+        "do_sample": false,
+        "temperature": 0.1,
+        "top_p": 0.001
+    },
+    "checkpoint_settings": {
+        "enable_checkpoints": true,
+        "pause_at_checkpoints": true,
+        "log_level": "INFO",
+        "checkpoint_dir": "./checkpoints"
+    }
+}
