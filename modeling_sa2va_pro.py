@@ -33,6 +33,7 @@ class Sa2VAProSegmentationOutput:
     prediction_masks: list[np.ndarray]
     pred_mask_logits: torch.Tensor | None = None
     raw_generation: Any | None = None
+    seg_readout_mode: str = "none"
 
 
 class DirectResize:
@@ -92,7 +93,12 @@ class Sa2VAProModel(PreTrainedModel):
                 attn_implementation="flash_attention_2" if use_flash_attn else "eager",
             )
 
-        llm_hidden_size = config.text_config.hidden_size if hasattr(config, "text_config") else 3584
+        text_config = getattr(config, "text_config", None)
+        llm_hidden_size = getattr(text_config, "hidden_size", None)
+        if llm_hidden_size is None:
+            llm_hidden_size = getattr(config, "hidden_size", None)
+        if llm_hidden_size is None:
+            raise ValueError("Cannot determine the Video-R1 language hidden size")
 
         self.grounding_encoder = SAM2()
         out_dim = self.grounding_encoder.hidden_dim
@@ -386,6 +392,68 @@ class Sa2VAProModel(PreTrainedModel):
             ret_masks.append(masks)
         return ret_masks, stacked_logits
 
+    def _forced_seg_hidden_states(self, generation_output, mm_inputs, processor) -> torch.Tensor:
+        """Read a contextual [SEG] state when a frozen Video-R1 never generates it.
+
+        Continue the generated answer with Sa2VA's short segmentation answer
+        template. The continuation is teacher-forced; it does not update weights
+        or pretend that Video-R1 generated a [SEG] token itself.
+        """
+        if self.seg_token_id is None:
+            raise ValueError("[SEG] token id is not set")
+
+        prompt_length = mm_inputs.input_ids.shape[1]
+        sequence = generation_output.sequences[0].to(mm_inputs.input_ids.device)
+        if sequence.numel() < prompt_length:
+            raise ValueError("Generated sequence is shorter than the multimodal prompt")
+
+        end_ids = self.model.generation_config.eos_token_id
+        if isinstance(end_ids, int):
+            end_ids = [end_ids]
+        stop_ids = {int(token_id) for token_id in (end_ids or [])}
+        pad_token_id = processor.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            stop_ids.add(int(pad_token_id))
+        while sequence.numel() > prompt_length and int(sequence[-1]) in stop_ids:
+            sequence = sequence[:-1]
+
+        suffix_ids = processor.tokenizer.encode(
+            f" It is {self.seg_token}.", add_special_tokens=False
+        )
+        seg_positions = [index for index, token_id in enumerate(suffix_ids)
+                         if token_id == self.seg_token_id]
+        if len(seg_positions) != 1:
+            raise ValueError(
+                f"Forced segmentation continuation must contain one [SEG] token; "
+                f"found {len(seg_positions)}"
+            )
+        suffix = torch.tensor(suffix_ids, dtype=sequence.dtype, device=sequence.device)
+        forced_ids = torch.cat((sequence, suffix)).unsqueeze(0)
+        forward_inputs = dict(mm_inputs)
+        forward_inputs["input_ids"] = forced_ids
+        prompt_attention_mask = mm_inputs.get("attention_mask")
+        if prompt_attention_mask is None:
+            forward_inputs["attention_mask"] = torch.ones_like(forced_ids)
+        else:
+            continuation_attention = torch.ones(
+                (1, forced_ids.shape[1] - prompt_length),
+                dtype=prompt_attention_mask.dtype,
+                device=prompt_attention_mask.device,
+            )
+            forward_inputs["attention_mask"] = torch.cat(
+                (prompt_attention_mask, continuation_attention), dim=1
+            )
+        outputs = self.model(
+            **forward_inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        if outputs.hidden_states is None:
+            raise RuntimeError("Video-R1 did not return hidden states for forced [SEG]")
+        seg_position = sequence.numel() + seg_positions[0]
+        return outputs.hidden_states[-1][0, seg_position : seg_position + 1]
+
     def generate_with_masks(
         self,
         messages: list[dict[str, Any]],
@@ -432,6 +500,7 @@ class Sa2VAProModel(PreTrainedModel):
 
         prediction_masks: list[np.ndarray] = []
         pred_mask_logits: torch.Tensor | None = None
+        seg_readout_mode = "none"
         if image is not None or video is not None:
             g_pixel_values, ori_image_size, num_frames, _ = self._prepare_grounding_inputs(image=image, video=video)
             g_pixel_values = g_pixel_values.to(self.device)
@@ -442,12 +511,28 @@ class Sa2VAProModel(PreTrainedModel):
                 ori_image_size,
                 num_frames,
             )
+            if prediction_masks:
+                seg_readout_mode = "generated"
+            else:
+                seg_hidden_states = self._forced_seg_hidden_states(
+                    generation_output, mm_inputs, processor
+                )
+                pred_mask_logits = self._decode_mask_logits_from_hidden_states(
+                    seg_hidden_states, g_pixel_values, ori_image_size, num_frames
+                )
+                if pred_mask_logits is not None:
+                    prediction_masks = [
+                        (logits.sigmoid() > 0.5).cpu().numpy()
+                        for logits in pred_mask_logits
+                    ]
+                    seg_readout_mode = "forced_continuation"
 
         return Sa2VAProSegmentationOutput(
             prediction=prediction,
             prediction_masks=prediction_masks,
             pred_mask_logits=pred_mask_logits,
             raw_generation=generation_output,
+            seg_readout_mode=seg_readout_mode,
         )
 
     def compute_segmentation_loss(
@@ -505,6 +590,8 @@ class Sa2VAProModel(PreTrainedModel):
         mask_prompts=None,
         tokenizer=None,
         processor=None,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
     ):
         if processor is None:
             raise ValueError("processor is required")
@@ -512,14 +599,21 @@ class Sa2VAProModel(PreTrainedModel):
         text = (text or "").replace("<image>", "")
         if image is None and video is None and "<image>" not in past_text:
             messages = [{"role": "user", "content": [{"type": "text", "text": past_text + text}]}]
-            result = self.generate_with_masks(messages=messages, processor=processor)
-            return {"prediction": result.prediction, "prediction_masks": result.prediction_masks}
+            result = self.generate_with_masks(
+                messages=messages, processor=processor,
+                max_new_tokens=max_new_tokens, do_sample=do_sample,
+            )
+            return {"prediction": result.prediction, "prediction_masks": result.prediction_masks,
+                    "seg_readout_mode": result.seg_readout_mode}
 
         if video is not None:
             content = [{"type": "image", "image": frame} for frame in video[:5]]
             content.append({"type": "text", "text": text})
             messages = [{"role": "user", "content": content}]
-            result = self.generate_with_masks(messages=messages, processor=processor, video=video)
+            result = self.generate_with_masks(
+                messages=messages, processor=processor, video=video,
+                max_new_tokens=max_new_tokens, do_sample=do_sample,
+            )
         else:
             messages = [
                 {
@@ -530,9 +624,13 @@ class Sa2VAProModel(PreTrainedModel):
                     ],
                 }
             ]
-            result = self.generate_with_masks(messages=messages, processor=processor, image=image)
+            result = self.generate_with_masks(
+                messages=messages, processor=processor, image=image,
+                max_new_tokens=max_new_tokens, do_sample=do_sample,
+            )
 
-        return {"prediction": result.prediction, "prediction_masks": result.prediction_masks}
+        return {"prediction": result.prediction, "prediction_masks": result.prediction_masks,
+                "seg_readout_mode": result.seg_readout_mode}
 
 
 def get_seg_hidden_states(

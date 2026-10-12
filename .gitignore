@@ -7,3 +7,43 @@ outputs/
 data/
 *.log
 *.tmp
+
+# Model weights, generated datasets, indexes, and experiment artifacts.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+*.sqlite
+*.sqlite-*
+*.db
+*.partial
+*.zip
+*.tar
+*.tar.gz
+*.7z
+data_indexes/
+pretrained/
+checkpoints/
+logs/
+backups/
+uploads/
+upload_*/
+
+# Machine-local environments, caches, credentials, and temporary files.
+.env
+.env.*
+!.env.example
+.venv/
+.uv-cache/
+.pytest_cache/
+.cache/
+tmp/
+*.pem
+*.key
+
+# Local presentations and server administration records.
+create_group_meeting_doc.py
+docs/STORAGE_RETENTION_REGISTRATION_*.md

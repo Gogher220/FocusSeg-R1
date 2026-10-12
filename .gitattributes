@@ -1,0 +1,2 @@
+# Cluster launchers must remain executable by Linux shells after checkout.
+*.sh text eol=lf

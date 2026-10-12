@@ -148,11 +148,28 @@ def load_prediction_from_json(
     video_id: str,
     exp_id: str,
     frame_index: int,
+    frame_name: str | None = None,
 ) -> np.ndarray | None:
     video_item = predictions.get(video_id)
     if not isinstance(video_item, dict):
         return None
     exp_item = video_item.get(str(exp_id))
+    if isinstance(exp_item, dict):
+        # The official Sa2VA results.json stores metadata and masks together.
+        # Older local predictions stored the RLE list directly.
+        frames = exp_item.get("frames")
+        masks = exp_item.get("prediction_masks")
+        if not isinstance(frames, list) or not isinstance(masks, list):
+            raise ValueError(f"Malformed prediction for {video_id}/{exp_id}")
+        if len(frames) != len(masks):
+            raise ValueError(f"Frame/mask count differs for {video_id}/{exp_id}")
+        if frame_name is not None and frame_index < len(frames):
+            if str(frames[frame_index]) != str(frame_name):
+                raise ValueError(
+                    f"Frame order differs for {video_id}/{exp_id} at {frame_index}: "
+                    f"{frames[frame_index]!r} != {frame_name!r}"
+                )
+        exp_item = masks
     if not isinstance(exp_item, list) or frame_index >= len(exp_item):
         return None
     return decode_rle(exp_item[frame_index])
@@ -169,15 +186,19 @@ def binary_jaccard(pred: np.ndarray, gt: np.ndarray) -> float:
 
 
 def mask_to_boundary(mask: np.ndarray) -> np.ndarray:
+    """DAVIS-style one-pixel boundary map (the seg2bmap construction)."""
     mask = mask.astype(bool)
-    if not mask.any():
-        return np.zeros_like(mask, dtype=bool)
-    padded = np.pad(mask, 1, mode="constant", constant_values=False)
-    eroded = np.ones_like(mask, dtype=bool)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            eroded &= padded[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
-    return np.logical_and(mask, np.logical_not(eroded))
+    east = np.zeros_like(mask)
+    south = np.zeros_like(mask)
+    southeast = np.zeros_like(mask)
+    east[:, :-1] = mask[:, 1:]
+    south[:-1, :] = mask[1:, :]
+    southeast[:-1, :-1] = mask[1:, 1:]
+    boundary = (mask ^ east) | (mask ^ south) | (mask ^ southeast)
+    boundary[-1, :] = mask[-1, :] ^ east[-1, :]
+    boundary[:, -1] = mask[:, -1] ^ south[:, -1]
+    boundary[-1, -1] = False
+    return boundary
 
 
 def disk_kernel(radius: int) -> np.ndarray:
@@ -249,7 +270,7 @@ def print_table(group_metrics: dict[str, dict[str, float | int]]) -> None:
     print("")
     print(f"{'Split':<10} {'N':>8} {'J':>10} {'F':>10} {'J&F':>10}")
     print("-" * 52)
-    for name in ("Overall", "Long", "Short", "Unknown"):
+    for name in ("Overall", "PaperBalanced", "Long", "Short", "Unknown"):
         if name not in group_metrics:
             continue
         item = group_metrics[name]
@@ -267,6 +288,7 @@ def main() -> int:
     parser.add_argument("--mask-dict", type=Path, default=DEFAULT_MASK_DICT)
     parser.add_argument("--pred-json", type=Path, default=None, help="Official results.json with RLE prediction masks.")
     parser.add_argument("--pred-root", type=Path, default=None, help="Prediction PNG root, e.g. work_dir/Annotations.")
+    parser.add_argument("--allow-missing-predictions", action="store_true", help="Treat missing predictions as empty masks instead of failing.")
     parser.add_argument("--out-json", type=Path, default=None)
     parser.add_argument("--details-jsonl", type=Path, default=None)
     parser.add_argument("--boundary-th", type=float, default=0.008)
@@ -338,7 +360,9 @@ def main() -> int:
                         continue
 
                     if predictions is not None:
-                        pred = load_prediction_from_json(predictions, video_id, str(exp_id), frame_index)
+                        pred = load_prediction_from_json(
+                            predictions, video_id, str(exp_id), frame_index, frame_name
+                        )
                     elif pred_root is not None:
                         pred = load_prediction_from_pngs(pred_root, video_id, str(exp_id), frame_name)
                     else:
@@ -346,6 +370,11 @@ def main() -> int:
 
                     if pred is None:
                         stats["missing_pred_frame"] += 1
+                        if predictions is not None and not args.allow_missing_predictions:
+                            raise ValueError(
+                                f"Missing prediction for {video_id}/{exp_id}/{frame_name}; "
+                                "use --allow-missing-predictions only for an intentional sparse evaluation"
+                            )
                         pred = np.zeros_like(gt, dtype=bool)
                     elif pred.shape != gt.shape:
                         stats["resized_pred_frame"] += 1
@@ -385,9 +414,19 @@ def main() -> int:
             details_file.close()
 
     group_metrics = {name: aggregate(items) for name, items in groups.items()}
+    if "Long" in group_metrics and "Short" in group_metrics:
+        long = group_metrics["Long"]
+        short = group_metrics["Short"]
+        group_metrics["PaperBalanced"] = {
+            "num_expressions": int(long["num_expressions"]) + int(short["num_expressions"]),
+            "J": (float(long["J"]) + float(short["J"])) / 2.0,
+            "F": (float(long["F"]) + float(short["F"])) / 2.0,
+            "J&F": (float(long["J&F"]) + float(short["J&F"])) / 2.0,
+        }
     print_table(group_metrics)
 
     output = {
+        "boundary_metric": "DAVIS-style seg2bmap and disk-dilation F, bound_th=0.008 by default",
         "meta": str(meta_path),
         "mask_dict": str(mask_dict_path),
         "pred_json": str(pred_json_path) if pred_json_path else None,

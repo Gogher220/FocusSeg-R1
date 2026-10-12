@@ -12,26 +12,32 @@ from sa2va_pro_utils import SEG_TOKEN, build_processor
 
 
 def load_sa2va_pro_model(
-    base_model_name_or_path: str = "Qwen/Qwen2-VL-2B-Instruct",
+    base_model_name_or_path: str,
     config_path: str | None = None,
     segmentation_init_path: str | None = None,
     trust_remote_code: bool = True,
 ):
     load_path = config_path or base_model_name_or_path
-    is_sa2va_checkpoint = False
+    base_config = AutoConfig.from_pretrained(load_path, trust_remote_code=trust_remote_code)
+    if getattr(base_config, "model_type", None) == "sa2va_chat":
+        raise ValueError(
+            "The official Sa2VA checkpoint is a baseline model, not a Sa2VA-Pro "
+            "checkpoint. Evaluate it with the official Sa2VA AutoModel path. "
+            "For Sa2VA-Pro, pass the Video-R1 model as base_model_name_or_path "
+            "and the official checkpoint as segmentation_init_path."
+        )
 
-    if config_path:
-        base_config = AutoConfig.from_pretrained(load_path, trust_remote_code=trust_remote_code)
-        is_sa2va_checkpoint = isinstance(base_config, Sa2VAProConfig) or getattr(base_config, "model_type", None) == Sa2VAProConfig.model_type
-        config = base_config if isinstance(base_config, Sa2VAProConfig) else Sa2VAProConfig.from_dict(base_config.to_dict())
-    else:
-        base_config = AutoConfig.from_pretrained(load_path, trust_remote_code=trust_remote_code)
-        is_sa2va_checkpoint = isinstance(base_config, Sa2VAProConfig) or getattr(base_config, "model_type", None) == Sa2VAProConfig.model_type
-        if is_sa2va_checkpoint:
-            config = Sa2VAProConfig.from_dict(base_config.to_dict())
-        else:
-            config = Sa2VAProConfig.from_dict(base_config.to_dict())
-            config.base_model_name_or_path = base_model_name_or_path
+    is_sa2va_checkpoint = (
+        isinstance(base_config, Sa2VAProConfig)
+        or getattr(base_config, "model_type", None) == Sa2VAProConfig.model_type
+    )
+    config = (
+        base_config
+        if isinstance(base_config, Sa2VAProConfig)
+        else Sa2VAProConfig.from_dict(base_config.to_dict())
+    )
+    if not config_path and not is_sa2va_checkpoint:
+        config.base_model_name_or_path = base_model_name_or_path
 
     if not getattr(config, "base_model_name_or_path", None):
         config.base_model_name_or_path = base_model_name_or_path
@@ -48,6 +54,20 @@ def load_sa2va_pro_model(
         or any(load_path_obj.glob("model-*.safetensors"))
         or any(load_path_obj.glob("pytorch_model*.bin"))
     )
+    segmentation_init_path = segmentation_init_path or os.environ.get("SA2VA_PRO_SEGMENTATION_INIT")
+    if has_local_weights and is_sa2va_checkpoint and segmentation_init_path:
+        raise ValueError(
+            "A saved FocusSeg-R1 checkpoint must not be reinitialized from Sa2VA. "
+            "Unset SA2VA_PRO_SEGMENTATION_INIT and omit segmentation_init_path "
+            "when loading the saved checkpoint."
+        )
+    if not (has_local_weights and is_sa2va_checkpoint) and not segmentation_init_path:
+        raise ValueError(
+            "Sa2VA-Pro initialization requires the trained segmentation interface "
+            "from an official Sa2VA checkpoint. Supply segmentation_init_path "
+            "or SA2VA_PRO_SEGMENTATION_INIT; SAM2-only initialization would leave "
+            "the [SEG] projection randomly initialized."
+        )
 
     if has_local_weights and is_sa2va_checkpoint:
         model = Sa2VAProModel.from_pretrained(load_path, config=config, trust_remote_code=trust_remote_code)
@@ -57,8 +77,8 @@ def load_sa2va_pro_model(
         if len(processor.tokenizer) > current_embedding_rows:
             model.resize_token_embeddings(len(processor.tokenizer))
     model.set_seg_token_id(seg_token_id)
+    model.model.requires_grad_(False)
 
-    segmentation_init_path = segmentation_init_path or os.environ.get("SA2VA_PRO_SEGMENTATION_INIT")
     sam2_ckpt = os.environ.get("SA2VA_PRO_SAM2_CKPT")
     if sam2_ckpt is None and not (has_local_weights and is_sa2va_checkpoint):
         sam2_ckpt = getattr(model.config, "sam2_ckpt_path", None)

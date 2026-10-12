@@ -118,6 +118,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run Ref-SAV mask inference.")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--config-path", default=None)
+    parser.add_argument("--segmentation-init", default=None, help="Official Sa2VA checkpoint supplying trained [SEG], projection and SAM2 weights.")
     parser.add_argument("--sam2-ckpt", default=None)
     parser.add_argument("--meta", type=Path, default=DEFAULT_META)
     parser.add_argument("--video-root", type=Path, default=DEFAULT_VIDEO_ROOT)
@@ -127,6 +128,7 @@ def main() -> int:
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-failures", action="store_true", help="Keep a partial run instead of exiting nonzero when an expression fails.")
     parser.add_argument("--postfix-every", type=int, default=25)
     args = parser.parse_args()
 
@@ -146,13 +148,18 @@ def main() -> int:
 
     print(f"Model: {args.model_path}")
     print(f"Config: {args.config_path}")
+    print(f"Segmentation init: {args.segmentation_init or os.environ.get('SA2VA_PRO_SEGMENTATION_INIT')}")
     print(f"SAM2 ckpt: {os.environ.get('SA2VA_PRO_SAM2_CKPT')}")
     print(f"Meta: {meta_path}")
     print(f"Video root: {video_root}")
     print(f"Output root: {out_root}")
     print(f"Device: {device}")
 
-    model, processor = load_sa2va_pro_model(args.model_path, config_path=args.config_path)
+    model, processor = load_sa2va_pro_model(
+        args.model_path,
+        config_path=args.config_path,
+        segmentation_init_path=args.segmentation_init,
+    )
     model.to(device)
     model.eval()
 
@@ -179,6 +186,9 @@ def main() -> int:
         "short_prediction": 0,
         "long_prediction": 0,
         "resized_prediction": 0,
+        "forced_readout": 0,
+        "generated_readout": 0,
+        "all_zero_prediction": 0,
         "failed": 0,
     }
 
@@ -199,6 +209,7 @@ def main() -> int:
             video_dir = video_root / video_id
             ann_dir = ann_root / video_id / exp_id
             target_shape: tuple[int, int] | None = None
+            seg_readout_mode = "resumed"
 
             try:
                 if args.resume and existing_prediction_complete(ann_dir, frame_names):
@@ -216,9 +227,21 @@ def main() -> int:
                             video=frames,
                             text=prompt,
                             processor=processor,
+                            max_new_tokens=args.max_new_tokens,
+                            do_sample=args.do_sample,
                         )
                     prediction_text = str(output.get("prediction", ""))
+                    seg_readout_mode = str(output.get("seg_readout_mode", "none"))
                     masks = normalize_prediction_masks(output.get("prediction_masks", []))
+                    if not masks:
+                        raise RuntimeError(
+                            "Model returned no segmentation masks; refusing to save "
+                            "zero masks as a successful prediction"
+                        )
+                    if seg_readout_mode == "forced_continuation":
+                        stats["forced_readout"] += 1
+                    elif seg_readout_mode == "generated":
+                        stats["generated_readout"] += 1
 
                 if target_shape is None:
                     first_frame = Image.open(video_dir / f"{frame_names[0]}.jpg")
@@ -231,6 +254,8 @@ def main() -> int:
                     stats["short_prediction"] += 1
                 if len(masks) > len(frame_names):
                     stats["long_prediction"] += 1
+                if masks and not any(np.any(mask) for mask in masks):
+                    stats["all_zero_prediction"] += 1
 
                 aligned_masks: list[np.ndarray] = []
                 for local_i, frame_name in enumerate(frame_names):
@@ -251,6 +276,7 @@ def main() -> int:
                             "video_id": video_id,
                             "exp_id": exp_id,
                             "prediction": prediction_text,
+                            "seg_readout_mode": seg_readout_mode,
                             "num_pred_masks": len(masks),
                             "num_frames": len(frame_names),
                         },
@@ -289,6 +315,9 @@ def main() -> int:
     summary = {
         "model_path": args.model_path,
         "config_path": args.config_path,
+        "segmentation_init_path": args.segmentation_init or os.environ.get("SA2VA_PRO_SEGMENTATION_INIT"),
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": args.do_sample,
         "meta": str(meta_path),
         "video_root": str(video_root),
         "out_root": str(out_root),
@@ -304,6 +333,8 @@ def main() -> int:
     print(f"prediction_texts: {text_path}")
     print(f"summary_json: {out_root / 'inference_summary.json'}")
     print(f"stats: {stats}")
+    if stats["failed"] and not args.allow_failures:
+        raise RuntimeError(f"{stats['failed']} expressions failed; inspect {text_path}")
     return 0
 
 
